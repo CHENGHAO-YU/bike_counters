@@ -1,0 +1,172 @@
+import pandas as pd
+import numpy as np
+from pathlib import Path
+from prophet import Prophet
+import warnings
+from tqdm import tqdm
+warnings.filterwarnings('ignore')
+
+
+def main():
+    # 定义数据路径
+    base_path = Path("D:/X-HEC/python for data science/pre/msdb-2024")
+
+    # 加载数据
+    print("加载数据...")
+    train = pd.read_parquet(base_path / "train.parquet")
+    test = pd.read_parquet(base_path / "final_test.parquet")
+    external = pd.read_csv(base_path / "external.csv")
+
+    # 将日期列转换为 datetime 类型
+    train['date'] = pd.to_datetime(train['date'])
+    test['date'] = pd.to_datetime(test['date'])
+    external['date'] = pd.to_datetime(external['date'], format='%Y/%m/%d %H:%M')
+
+    # 添加时间特征
+    def add_time_features(df):
+        df['hour'] = df['date'].dt.hour
+        df['weekday'] = df['date'].dt.weekday
+        df['month'] = df['date'].dt.month
+        df['day'] = df['date'].dt.day
+        df['is_weekend'] = (df['weekday'] >= 5).astype(int)
+        
+        # 添加周期性特征
+        df['hour_sin'] = np.sin(2 * np.pi * df['hour']/24)
+        df['hour_cos'] = np.cos(2 * np.pi * df['hour']/24)
+        df['month_sin'] = np.sin(2 * np.pi * df['month']/12)
+        df['month_cos'] = np.cos(2 * np.pi * df['month']/12)
+        df['day_sin'] = np.sin(2 * np.pi * df['day']/31)
+        df['day_cos'] = np.cos(2 * np.pi * df['day']/31)
+        df['weekday_sin'] = np.sin(2 * np.pi * df['weekday']/7)
+        df['weekday_cos'] = np.cos(2 * np.pi * df['weekday']/7)
+        return df
+
+    print("添加时间特征...")
+    train = add_time_features(train)
+    test = add_time_features(test)
+
+    # 计算安装时间（单位：天）
+    train['installation_days'] = (train['date'] - pd.to_datetime(train['counter_installation_date'])).dt.days
+    test['installation_days'] = (test['date'] - pd.to_datetime(test['counter_installation_date'])).dt.days
+
+    # 合并天气数据
+    print("合并天气数据...")
+    train = train.merge(external, on='date', how='left')
+    test = test.merge(external, on='date', how='left')
+
+    # 天气相关特征
+    weather_features = [
+        't', 'vv', 'rr3', 'n', 'pres', 'tend24', 'raf10',
+        'td', 'ww', 'nbas', 'hbas', 'rafper', 'rr1', 'rr6', 'rr12', 'rr24'
+    ]
+
+    # 填充天气数据的缺失值并进行特征工程
+    for feature in weather_features:
+        # 使用更复杂的填充策略
+        feature_mean = train[feature].mean()
+        feature_std = train[feature].std()
+        train[feature] = train[feature].fillna(feature_mean)
+        test[feature] = test[feature].fillna(feature_mean)
+        
+        # 添加统计特征
+        train[f'{feature}_rolling_mean_24h'] = train.groupby('counter_id')[feature].rolling(24).mean().reset_index(0, drop=True)
+        test[f'{feature}_rolling_mean_24h'] = test.groupby('counter_id')[feature].rolling(24).mean().reset_index(0, drop=True)
+
+    # 添加lag特征
+    def add_lag_features(df):
+        lags = [1, 2, 3, 24]  # 增加更多的lag特征
+        for lag in lags:
+            df[f'weather_lag_{lag}'] = df.groupby('counter_id')['t'].shift(lag)  # 使用温度作为主要lag特征
+        return df
+
+    print("添加lag特征...")
+    train = add_lag_features(train)
+    test = add_lag_features(test)
+
+    # 填充新创建的特征的空值
+    train = train.fillna(method='bfill').fillna(method='ffill')
+    test = test.fillna(method='bfill').fillna(method='ffill')
+
+    print("开始训练模型和预测...")
+    predictions = []
+    unique_counters = train['counter_id'].unique()
+
+    # 对每个计数器进行训练和预测
+    for counter_id in tqdm(unique_counters, desc="处理计数器"):
+        try:
+            # 准备训练数据
+            train_data = train[train['counter_id'] == counter_id].copy()
+            train_data = train_data.rename(columns={
+                'date': 'ds',
+                'log_bike_count': 'y'
+            })
+
+            # 初始化模型，使用更优化的参数
+            model = Prophet(
+                yearly_seasonality=20,  # 使用更多的傅里叶项
+                weekly_seasonality=10,
+                daily_seasonality=True,
+                changepoint_prior_scale=0.01,  # 减小以使趋势更加稳定
+                seasonality_prior_scale=20,    # 增大以捕捉更强的季节性
+                holidays_prior_scale=10,
+                interval_width=0.95,
+                seasonality_mode='multiplicative'  # 使用乘法季节性
+            )
+
+            # 添加所有特征作为回归变量
+            all_features = (weather_features + 
+                          [f'{f}_rolling_mean_24h' for f in weather_features] +
+                          [f'weather_lag_{lag}' for lag in [1, 2, 3, 24]] +
+                          ['hour_sin', 'hour_cos', 'month_sin', 'month_cos',
+                           'day_sin', 'day_cos', 'weekday_sin', 'weekday_cos',
+                           'installation_days'])
+
+            for feature in all_features:
+                if feature in train_data.columns:
+                    train_data[feature] = train_data[feature].astype(float)
+                    model.add_regressor(feature)
+
+            # 训练模型
+            model.fit(train_data)
+
+            # 准备预测数据
+            future = test[test['counter_id'] == counter_id].copy()
+            future = future.rename(columns={'date': 'ds'})
+            
+            # 确保所有特征都是float类型
+            for feature in all_features:
+                if feature in future.columns:
+                    future[feature] = future[feature].astype(float)
+
+            # 预测
+            forecast = model.predict(future)
+            forecast['counter_id'] = counter_id
+            predictions.append(forecast[['ds', 'yhat', 'counter_id']])
+
+            # 清理内存
+            del model, train_data, future, forecast
+            import gc
+            gc.collect()
+
+        except Exception as e:
+            print(f"处理计数器 {counter_id} 时出错: {str(e)}")
+            continue
+
+    # 合并所有预测结果
+    final_predictions = pd.concat(predictions)
+
+    # 准备提交文件
+    submission = test[['counter_id', 'counter_name', 'site_id', 'site_name', 'date']].copy()
+    submission = submission.merge(
+        final_predictions[['ds', 'counter_id', 'yhat']].rename(columns={'ds': 'date', 'yhat': 'log_bike_count'}),
+        on=['counter_id', 'date'],
+        how='left'
+    )
+
+    # 保存结果
+    print("保存预测结果...")
+    submission.to_csv(base_path / "submission.csv", index=False)
+    print("预测完成，结果已保存为 submission.csv 文件")
+
+if __name__ == '__main__':
+    main()
