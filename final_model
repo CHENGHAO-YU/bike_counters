@@ -79,9 +79,6 @@ target = 'log_bike_count'
 X = train[features].values
 y = train[target].values
 
-# Shuffle the data to ensure randomness before splitting into time series folds
-X, y = shuffle(X, y, random_state=42)
-
 tscv = TimeSeriesSplit(n_splits=5)
 
 best_rmse = float('inf')
